@@ -1,183 +1,428 @@
-import os, re, json, time, requests
-from difflib import SequenceMatcher
-from datetime import datetime, timezone, timedelta
+#!/usr/bin/env python3
+"""
+X analytics collector — Phase 1.1
+
+What it does (once per run):
+  1. Resolves a target day (default: today − 3 days, Kyiv time).
+  2. Opens an X search for @HANDLE posts from that exact day (replies excluded).
+  3. For every post: extracts URL, Post ID, timestamp, text and views.
+  4. Upserts a row in the Post Outputs Notion DB (by Post ID — no duplicates).
+  5. Freezes the metric (views) once; never overwrites a frozen metric.
+  6. Matches the post to a Content Pulse draft by PAGE-BODY text (fuzzy).
+  7. Logs the whole run into the Collection Runs DB.
+
+All config comes from environment variables / GitHub Secrets.
+"""
+
+import os
+import re
+import sys
+import json
+import difflib
+from datetime import datetime, timedelta
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+import requests
 from playwright.sync_api import sync_playwright
 
-NOTION_TOKEN=os.getenv('NOTION_TOKEN','').strip()
-DATABASE_ID=os.getenv('DATABASE_ID','').strip()
-CONTENT_PULSE_DATABASE_ID=os.getenv('CONTENT_PULSE_DATABASE_ID','').strip()
-X_HANDLE=os.getenv('X_HANDLE','Mylovanov').strip().lstrip('@')
-X_COOKIES_JSON=os.getenv('X_COOKIES_JSON','').strip()
-TARGET_DATE=os.getenv('TARGET_DATE','2026-07-28').strip()
-SAVE_LIMIT=int(os.getenv('SAVE_LIMIT','10').strip() or '0')
-MAX_SCROLLS=int(os.getenv('MAX_SCROLLS','500').strip() or '500')
-NOTION_VERSION='2022-06-28'
-CODE_VERSION='v5_exact_day_x_search_no_replies_body_match'
+# ----------------------------- Config ---------------------------------------
+KYIV = ZoneInfo("Europe/Kyiv")
+NOTION_API = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
 
-def clean_id(v):
-    v=(v or '').strip(); m=re.findall(r'[0-9a-fA-F]{32}', v.replace('-',''))
-    return m[-1] if m else v.replace('-','')
-DATABASE_ID=clean_id(DATABASE_ID); CONTENT_PULSE_DATABASE_ID=clean_id(CONTENT_PULSE_DATABASE_ID)
-START_DT=datetime.fromisoformat(TARGET_DATE).replace(tzinfo=timezone.utc)
-END_DT=START_DT+timedelta(days=1)
-UNTIL_DATE=END_DT.date().isoformat()
+TOKEN = (os.environ.get("NOTION_TOKEN") or "").strip()
+POST_OUTPUTS_DB = (os.environ.get("DATABASE_ID") or "").strip()
+CONTENT_PULSE_DB = (os.environ.get("CONTENT_PULSE_DATABASE_ID") or "").strip()
+RUNS_DB = (os.environ.get("COLLECTION_RUNS_DATABASE_ID") or "").strip()
 
-def headers(): return {'Authorization':f'Bearer {NOTION_TOKEN}','Notion-Version':NOTION_VERSION,'Content-Type':'application/json'}
-def norm(s):
-    s=(s or '').lower(); s=re.sub(r'https?://\S+',' ',s); s=re.sub(r'[^\w\sа-яіїєґєіїʼ\'-]',' ',s,flags=re.I)
-    return re.sub(r'\s+',' ',s).strip()[:1200]
-def sim(a,b):
-    a,b=norm(a),norm(b); return SequenceMatcher(None,a,b).ratio() if a and b else 0
+X_HANDLE = (os.environ.get("X_HANDLE") or "Mylovanov").strip().lstrip("@")
+COOKIES_RAW = os.environ.get("X_COOKIES_JSON") or "[]"
 
-def number(s):
-    s=s.strip().replace(' ','').replace(',','.'); mult=1
-    if s[-1:].upper() in ['K','К']: mult,s=1000,s[:-1]
-    elif s[-1:].upper() in ['M','М']: mult,s=1000000,s[:-1]
-    elif s[-1:].upper() in ['B','Б']: mult,s=1000000000,s[:-1]
-    try: return int(float(s)*mult)
-    except: return None
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "3"))
+MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.6"))
+MAX_SCROLLS = int(os.environ.get("MAX_SCROLLS", "80"))
+TARGET_DATE_OVERRIDE = (os.environ.get("TARGET_DATE") or "").strip()
 
-def parse_views(t):
-    if not t: return None
-    t=t.replace('\u202f',' ').replace('\xa0',' ')
-    pats=[r'([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)\s+(?:Views|views|перегляд|перегляди|переглядів)',r'(?:Views|views|перегляди|переглядів)\s*[:·]?\s*([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)']
-    for p in pats:
-        m=re.search(p,t)
-        if m: return number(m.group(1))
+# Content Pulse statuses we DO NOT match against.
+EXCLUDE_STATUSES = {
+    "Old idea", "Idea", "Morning Idea", "Done",
+    "Scheduled", "Sent back", "In progress", "Тимофій апрувить",
+}
+
+
+def clean_id(v: str) -> str:
+    """Keep only hex chars — tolerates stray newlines/spaces in secrets."""
+    return re.sub(r"[^0-9a-fA-F]", "", v or "")
+
+
+def headers() -> dict:
+    return {
+        "Authorization": f"Bearer {TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def resolve_target_date():
+    if TARGET_DATE_OVERRIDE:
+        return datetime.strptime(TARGET_DATE_OVERRIDE, "%Y-%m-%d").date()
+    return datetime.now(KYIV).date() - timedelta(days=LOOKBACK_DAYS)
+
+
+# ----------------------------- Scraping -------------------------------------
+def build_search_url(day) -> str:
+    since = day.isoformat()
+    until = (day + timedelta(days=1)).isoformat()
+    q = f"from:{X_HANDLE} since:{since} until:{until} -filter:replies"
+    return "https://x.com/search?q=" + quote(q) + "&src=typed_query&f=live"
+
+
+def _num_from(s):
+    s = (s or "").replace(",", "").strip()
+    m = re.search(r"([\d.]+)\s*([KMkm]?)", s)
+    if not m:
+        return None
+    val = float(m.group(1))
+    suf = m.group(2).upper()
+    if suf == "K":
+        val *= 1_000
+    elif suf == "M":
+        val *= 1_000_000
+    return int(val)
+
+
+def _parse_views(article):
+    el = article.query_selector("a[href$='/analytics']")
+    if el:
+        label = el.get_attribute("aria-label") or el.inner_text() or ""
+        n = _num_from(re.sub(r"views?", "", label, flags=re.I))
+        if n is not None:
+            return n
+    grp = article.query_selector("div[role='group']")
+    if grp:
+        label = grp.get_attribute("aria-label") or ""
+        m = re.search(r"([\d.,KMkm]+)\s+views", label)
+        if m:
+            return _num_from(m.group(1))
     return None
 
-def prop_payload(props,name,value):
-    if name not in props or value is None: return None
-    typ=props[name]['type']
-    if typ=='title': return {'title':[{'text':{'content':str(value)[:2000]}}]}
-    if typ=='rich_text': return {'rich_text':[{'text':{'content':str(value)[:2000]}}]}
-    if typ=='number': return {'number':int(value)}
-    if typ=='url': return {'url':str(value)}
-    if typ=='date': return {'date':{'start':str(value)}}
-    if typ=='select': return {'select':{'name':str(value)}}
-    if typ=='status': return {'status':{'name':str(value)}}
-    return None
 
-def db_props(db):
-    r=requests.get(f'https://api.notion.com/v1/databases/{db}',headers=headers(),timeout=30)
-    if r.status_code!=200: print('db load error',r.status_code,r.text); return {}
-    props=r.json().get('properties',{}); print('loaded database properties:',', '.join(props.keys())); return props
-
-def plain(prop):
-    typ=prop.get('type') if prop else None
-    if typ=='title': return ''.join(x.get('plain_text','') for x in prop.get('title',[]))
-    if typ=='rich_text': return ''.join(x.get('plain_text','') for x in prop.get('rich_text',[]))
-    return ''
-
-def block_text(page_id):
-    out=[]; cursor=None
-    for _ in range(4):
-        url=f'https://api.notion.com/v1/blocks/{page_id}/children?page_size=100' + (f'&start_cursor={cursor}' if cursor else '')
-        r=requests.get(url,headers=headers(),timeout=30)
-        if r.status_code!=200: break
-        data=r.json()
-        for b in data.get('results',[]):
-            typ=b.get('type'); obj=b.get(typ,{})
-            if 'rich_text' in obj: out.append(''.join(x.get('plain_text','') for x in obj.get('rich_text',[])))
-        if not data.get('has_more'): break
-        cursor=data.get('next_cursor')
-    return '\n'.join(out)
-
-def content_items():
-    if not CONTENT_PULSE_DATABASE_ID: print('no CONTENT_PULSE_DATABASE_ID'); return []
-    r=requests.post(f'https://api.notion.com/v1/databases/{CONTENT_PULSE_DATABASE_ID}/query',headers=headers(),json={'page_size':100},timeout=30)
-    if r.status_code!=200: print('content pulse query error',r.status_code,r.text); return []
-    items=[]
-    for p in r.json().get('results',[]):
-        props_text='\n'.join(plain(x) for x in p.get('properties',{}).values())
-        body=block_text(p['id'])
-        text=(props_text+'\n'+body).strip()
-        if text: items.append({'id':p['id'],'text':text})
-    print('loaded content pulse candidates with body:',len(items)); return items
-
-def match_cp(post_text,cands):
-    best=(0,None)
-    for c in cands:
-        sc=sim(post_text,c['text'])
-        if sc>best[0]: best=(sc,c)
-    if best[0]>=0.38:
-        print(f'content pulse match score={best[0]:.2f}'); return best[1]['id']
-    print(f'no content pulse match, best_score={best[0]:.2f}'); return None
-
-def save(item,props,cands):
-    properties={}
-    for k,v in {'Post':f"X post {item['id']}",'Channel':'X','Published at':item['published_at'],'Metric type':'Views','Metric':item['views'],'Post URL':item['url'],'Run status':'Views captured'}.items():
-        pp=prop_payload(props,k,v)
-        if pp: properties[k]=pp
-    mid=match_cp(item['text'],cands)
-    if mid and props.get('Content Pulse Item',{}).get('type')=='relation': properties['Content Pulse Item']={'relation':[{'id':mid}]}
-    r=requests.post('https://api.notion.com/v1/pages',headers=headers(),json={'parent':{'database_id':DATABASE_ID},'properties':properties},timeout=30)
-    if r.status_code not in (200,201): print('notion error',r.status_code,r.text); return False
-    print(f"saved to Notion: {item['id']} {item['published_at']} views={item['views']}"); return True
-
-def add_cookies(ctx):
-    cs=json.loads(X_COOKIES_JSON) if X_COOKIES_JSON else []
-    cs=cs.get('cookies',[]) if isinstance(cs,dict) else cs
-    for c in cs:
-        c.setdefault('domain','.x.com'); c.setdefault('path','/')
-        if c.get('sameSite') not in [None,'Strict','Lax','None']: c.pop('sameSite',None)
-    if cs: ctx.add_cookies(cs)
-    print('loaded cookies:',len(cs))
-
-def extract(article):
+def _extract_article(article):
     try:
-        text=article.inner_text(timeout=3000); low=text.lower()
-        if any(x in low for x in ['replying to','у відповідь','в ответ']): return None
-        links=article.locator("a[href*='/status/']").evaluate_all('els => els.map(a => a.href)')
-        ids=[]
-        for href in links:
-            m=re.search(rf'/({re.escape(X_HANDLE)})/status/(\d+)',href,re.I)
-            if m: ids.append(m.group(2))
-        if not ids: return None
-        post_id=ids[0]
-        times=article.locator('time').evaluate_all("els => els.map(t => t.getAttribute('datetime'))")
-        if not times: return None
-        published_at=times[0]
-        dt=datetime.fromisoformat(published_at.replace('Z','+00:00'))
-        if not (START_DT <= dt < END_DT): return None
-        aria=article.evaluate("""el => Array.from(el.querySelectorAll('[aria-label]')).map(x => x.getAttribute('aria-label')).filter(Boolean).join(' | ')""")
-        v=parse_views(text) or parse_views(aria)
-        if v is None or v>20000000: return None
-        return {'id':post_id,'published_at':published_at,'dt':dt,'views':v,'url':f'https://x.com/{X_HANDLE}/status/{post_id}','text':text}
-    except Exception as e:
-        print('extract error',repr(e)); return None
+        pid, url = None, None
+        for el in article.query_selector_all("a[href*='/status/']"):
+            href = el.get_attribute("href") or ""
+            m = re.search(r"/status/(\d+)", href)
+            if m:
+                pid = m.group(1)
+                url = href.split("?")[0]
+                if url.startswith("/"):
+                    url = "https://x.com" + url
+                break
+        if not pid:
+            return None
+        t = article.query_selector("time")
+        ts = t.get_attribute("datetime") if t else None
+        text_el = article.query_selector("div[data-testid='tweetText']")
+        text = (text_el.inner_text() if text_el else "").strip()
+        social = article.query_selector("div[data-testid='socialContext']")
+        is_repost = bool(social and "repost" in ((social.inner_text() or "").lower()))
+        return {
+            "post_id": pid,
+            "url": url,
+            "published_at": ts,
+            "text": text,
+            "views": _parse_views(article),
+            "is_repost": is_repost,
+        }
+    except Exception:
+        return None
 
-def main():
-    print('CODE_VERSION:',CODE_VERSION)
-    print(f'EXACT_TARGET_DATE: {TARGET_DATE}; only this day; {UNTIL_DATE} excluded')
-    q=f'from:{X_HANDLE} since:{TARGET_DATE} until:{UNTIL_DATE} -filter:replies'
-    search_url='https://x.com/search?q='+quote(q)+'&src=typed_query&f=live'
-    print('X_SEARCH_QUERY:',q)
-    print('save limit:',SAVE_LIMIT)
-    seen={}
+
+def scrape_posts(day):
+    os.makedirs("debug", exist_ok=True)
+    cookies = json.loads(COOKIES_RAW)
+    norm = []
+    for c in cookies:
+        nc = {
+            "name": c.get("name"),
+            "value": c.get("value"),
+            "domain": c.get("domain", ".x.com"),
+            "path": c.get("path", "/"),
+        }
+        exp = c.get("expires") or c.get("expirationDate")
+        if isinstance(exp, (int, float)):
+            nc["expires"] = int(exp)
+        norm.append(nc)
+
+    results = {}
     with sync_playwright() as p:
-        br=p.chromium.launch(headless=True); ctx=br.new_context(viewport={'width':1400,'height':1800}); add_cookies(ctx)
-        page=ctx.new_page(); page.goto(search_url,wait_until='domcontentloaded',timeout=60000); time.sleep(5)
-        page.screenshot(path='x_debug_home.png',full_page=True)
-        no_new=0
-        for s in range(MAX_SCROLLS):
-            arts=page.locator('article'); count=arts.count(); new=0
-            for i in range(count):
-                it=extract(arts.nth(i))
-                if it and it['id'] not in seen:
-                    seen[it['id']]=it; new+=1; print(f"qualified found: {it['id']} {it['published_at']} views={it['views']}")
-            print(f'scroll {s}: article nodes={count}, qualified_raw={len(seen)}, new_this_scroll={new}')
-            no_new=no_new+1 if new==0 else 0
-            if no_new>=35: break
-            page.mouse.wheel(0,3500); time.sleep(2)
-        page.screenshot(path='x_debug_after_scroll.png',full_page=True); br.close()
-    items=sorted(seen.values(),key=lambda x:x['dt'],reverse=True)
-    print(f'FINAL qualified posts for exact date {TARGET_DATE}:',len(items))
-    for x in items[:50]: print(f"QUALIFIED_CHECK: {x['id']} {x['published_at']} views={x['views']}")
-    if SAVE_LIMIT>0: items=items[:SAVE_LIMIT]; print('limited qualified for test:',len(items))
-    props=db_props(DATABASE_ID); cands=content_items()
-    saved=sum(1 for it in items if save(it,props,cands))
-    print(f'saved={saved}, attempted={len(items)}')
-    print('verdict: saved to Notion' if saved else 'verdict: none saved')
-if __name__=='__main__': main()
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = browser.new_context(
+            locale="en-US",
+            viewport={"width": 1280, "height": 2000},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            ),
+        )
+        ctx.add_cookies(norm)
+        page = ctx.new_page()
+        page.goto(build_search_url(day), timeout=60_000)
+        page.wait_for_timeout(5_000)
+        page.screenshot(path="debug/search_top.png")
+
+        last, stable = -1, 0
+        for _ in range(MAX_SCROLLS):
+            for a in page.query_selector_all("article"):
+                data = _extract_article(a)
+                if data:
+                    results[data["post_id"]] = data
+            if len(results) == last:
+                stable += 1
+                if stable >= 4:
+                    break
+            else:
+                stable = 0
+            last = len(results)
+            page.mouse.wheel(0, 4_000)
+            page.wait_for_timeout(1_500)
+
+        page.screenshot(path="debug/search_bottom.png")
+        browser.close()
+    return list(results.values())
+
+
+# ----------------------------- Notion I/O -----------------------------------
+def find_existing(post_id):
+    r = requests.post(
+        f"{NOTION_API}/databases/{clean_id(POST_OUTPUTS_DB)}/query",
+        headers=headers(),
+        json={"filter": {"property": "Post ID",
+                          "rich_text": {"equals": post_id}}, "page_size": 1},
+    )
+    r.raise_for_status()
+    res = r.json().get("results", [])
+    return res[0] if res else None
+
+
+def build_props(post, match):
+    title = post["text"][:120] if post["text"] else f"X post {post['post_id']}"
+    props = {
+        "Post": {"title": [{"text": {"content": title}}]},
+        "Post ID": {"rich_text": [{"text": {"content": post["post_id"]}}]},
+        "Post URL": {"url": post["url"]},
+        "Channel": {"select": {"name": "X"}},
+        "Collected at": {"date": {"start": datetime.now(KYIV).isoformat()}},
+        "Run status": {"select": {"name":
+            "Views captured" if post.get("views") is not None else "No views"}},
+    }
+    if post.get("published_at"):
+        props["Published at"] = {"date": {"start": post["published_at"]}}
+    if post.get("views") is not None:
+        props["Metric"] = {"number": post["views"]}
+        props["Metric frozen"] = {"checkbox": True}
+    if match:
+        props["Content Pulse Item"] = {"relation": [{"id": match["id"]}]}
+        props["Match status"] = {"select": {"name": "✅ Matched"}}
+    else:
+        props["Match status"] = {"select": {"name": "⚠️ Needs review"}}
+    return props
+
+
+def create_row(props, unmatched):
+    payload = {"parent": {"database_id": clean_id(POST_OUTPUTS_DB)}, "properties": props}
+    if unmatched:
+        payload["icon"] = {"type": "emoji", "emoji": "🔴"}
+    r = requests.post(f"{NOTION_API}/pages", headers=headers(), json=payload)
+    r.raise_for_status()
+
+
+def update_row(page, props, unmatched):
+    # Respect a frozen metric: never overwrite it.
+    frozen = page["properties"].get("Metric frozen", {}).get("checkbox", False)
+    if frozen:
+        props.pop("Metric", None)
+        props.pop("Metric frozen", None)
+    payload = {"properties": props}
+    if unmatched:
+        payload["icon"] = {"type": "emoji", "emoji": "🔴"}
+    r = requests.patch(f"{NOTION_API}/pages/{page['id']}", headers=headers(), json=payload)
+    r.raise_for_status()
+    return frozen
+
+
+def content_pulse_candidates(day):
+    start = (day - timedelta(days=3)).isoformat()
+    end = (day + timedelta(days=3)).isoformat()
+    flt = {"and": [
+        {"property": "Channel", "multi_select": {"contains": "X"}},
+        {"property": "Date", "date": {"on_or_after": start}},
+        {"property": "Date", "date": {"on_or_before": end}},
+    ]}
+    out, cursor = [], None
+    while True:
+        body = {"filter": flt, "page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        r = requests.post(
+            f"{NOTION_API}/databases/{clean_id(CONTENT_PULSE_DB)}/query",
+            headers=headers(), json=body)
+        r.raise_for_status()
+        j = r.json()
+        for pg in j.get("results", []):
+            st = (pg["properties"].get("Status", {}) or {}).get("status") or {}
+            if st.get("name") in EXCLUDE_STATUSES:
+                continue
+            out.append(pg)
+        if j.get("has_more"):
+            cursor = j.get("next_cursor")
+        else:
+            break
+    return out
+
+
+def page_body_text(page_id):
+    parts, cursor = [], None
+    while True:
+        url = f"{NOTION_API}/blocks/{clean_id(page_id)}/children?page_size=100"
+        if cursor:
+            url += f"&start_cursor={cursor}"
+        r = requests.get(url, headers=headers())
+        if r.status_code != 200:
+            break
+        j = r.json()
+        for b in j.get("results", []):
+            payload = b.get(b.get("type"), {})
+            if isinstance(payload, dict):
+                for rt in payload.get("rich_text", []):
+                    parts.append(rt.get("plain_text", ""))
+        if j.get("has_more"):
+            cursor = j.get("next_cursor")
+        else:
+            break
+    return "\n".join(parts)
+
+
+def _normalize(s):
+    s = re.sub(r"https?://\S+", "", s or "")
+    s = re.sub(r"\s+", " ", s).lower().strip()
+    return s
+
+
+def similarity(tweet, body):
+    tw, bd = _normalize(tweet), _normalize(body)
+    if not tw or not bd:
+        return 0.0
+    ratio = difflib.SequenceMatcher(None, tw, bd).ratio()
+    if tw in bd:
+        return 1.0
+    m = difflib.SequenceMatcher(None, tw, bd).find_longest_match(0, len(tw), 0, len(bd))
+    contain = m.size / max(len(tw), 1)
+    return max(ratio, contain)
+
+
+def log_run(day, stats, status, notes):
+    if not RUNS_DB:
+        return
+    props = {
+        "Run": {"title": [{"text": {"content": f"X · {day.isoformat()}"}}]},
+        "Run at": {"date": {"start": datetime.now(KYIV).isoformat()}},
+        "Target date": {"date": {"start": day.isoformat()}},
+        "Status": {"select": {"name": status}},
+        "Posts found": {"number": stats["found"]},
+        "Rows created": {"number": stats["created"]},
+        "Rows updated": {"number": stats["updated"]},
+        "Metrics frozen": {"number": stats["frozen"]},
+        "Matched": {"number": stats["matched"]},
+        "Needs review": {"number": stats["review"]},
+    }
+    if notes:
+        props["Errors / notes"] = {"rich_text": [{"text": {"content": notes[:1900]}}]}
+    try:
+        requests.post(f"{NOTION_API}/pages", headers=headers(),
+                      json={"parent": {"database_id": clean_id(RUNS_DB)},
+                            "properties": props})
+    except Exception as e:
+        print("Could not log run:", e)
+
+
+# ----------------------------- Main -----------------------------------------
+def main():
+    if not TOKEN or not POST_OUTPUTS_DB:
+        print("Missing NOTION_TOKEN or DATABASE_ID")
+        sys.exit(1)
+
+    day = resolve_target_date()
+    print(f"Target date (Kyiv): {day}")
+    stats = {"found": 0, "created": 0, "updated": 0,
+             "frozen": 0, "matched": 0, "review": 0}
+    notes = []
+    status = "✅ OK"
+
+    try:
+        posts = scrape_posts(day)
+    except Exception as e:
+        log_run(day, stats, "❌ Failed", f"Scrape error: {e}")
+        print("Scrape failed:", e)
+        sys.exit(1)
+
+    stats["found"] = len(posts)
+    print(f"Found {len(posts)} posts")
+    if not posts:
+        log_run(day, stats, "❌ Failed",
+                "0 posts found — cookies may be expired or the day is empty.")
+        sys.exit(1)
+
+    # Preload Content Pulse candidate bodies once.
+    cand_bodies = []
+    try:
+        if CONTENT_PULSE_DB:
+            for pg in content_pulse_candidates(day):
+                cand_bodies.append((pg, page_body_text(pg["id"])))
+    except Exception as e:
+        notes.append(f"Content Pulse query error: {e}")
+        status = "⚠️ Warning"
+
+    for post in posts:
+        try:
+            match, best = None, 0.0
+            if cand_bodies and post["text"]:
+                for pg, body in cand_bodies:
+                    sc = similarity(post["text"], body)
+                    if sc > best:
+                        best, match = sc, pg
+                if best < MATCH_THRESHOLD:
+                    match = None
+            unmatched = match is None
+            props = build_props(post, match)
+            existing = find_existing(post["post_id"])
+            if existing:
+                was_frozen = update_row(existing, props, unmatched)
+                stats["updated"] += 1
+                if post.get("views") is not None and not was_frozen:
+                    stats["frozen"] += 1
+            else:
+                create_row(props, unmatched)
+                stats["created"] += 1
+                if post.get("views") is not None:
+                    stats["frozen"] += 1
+            if match:
+                stats["matched"] += 1
+            else:
+                stats["review"] += 1
+        except requests.HTTPError as e:
+            notes.append(f"{post['post_id']}: {e.response.text[:200]}")
+            status = "⚠️ Warning"
+        except Exception as e:
+            notes.append(f"{post['post_id']}: {e}")
+            status = "⚠️ Warning"
+
+    log_run(day, stats, status, " | ".join(notes))
+    print("Done:", stats)
+
+
+if __name__ == "__main__":
+    main()
