@@ -42,13 +42,14 @@ def parse_number(text):
 def extract_views_from_text(text):
     if not text:
         return None
+    # Looks for compact metrics like 210K, 39K, 12K.
     candidates = re.findall(r"\b\d+(?:[.,]\d+)?[KMB]?\b", text, flags=re.IGNORECASE)
-    compact = []
+    values = []
     for candidate in candidates:
         value = parse_number(candidate)
         if value is not None:
-            compact.append(value)
-    return max(compact) if compact else None
+            values.append(value)
+    return max(values) if values else None
 
 
 def normalize_cookies(raw):
@@ -76,7 +77,10 @@ def normalize_cookies(raw):
 def collect_posts():
     posts = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 1400},
@@ -85,6 +89,7 @@ def collect_posts():
         cookies = normalize_cookies(X_COOKIES_JSON)
         context.add_cookies(cookies)
         print(f"loaded cookies: {len(cookies)}")
+
         page = context.new_page()
         url = f"https://x.com/{HANDLE}"
         print(f"opening {url}")
@@ -92,13 +97,17 @@ def collect_posts():
         page.wait_for_timeout(8000)
         page.screenshot(path="x_debug_home.png", full_page=True)
         print("saved screenshot: x_debug_home.png")
+
         seen = set()
         for scroll_index in range(12):
             articles = page.query_selector_all("article")
             print(f"scroll {scroll_index}: article nodes={len(articles)}")
+
             for article in articles:
                 try:
-                    text = article.inner_text(timeout=3000)
+                    # IMPORTANT: ElementHandle.inner_text() in this Playwright version has no timeout argument.
+                    text = article.inner_text()
+
                     link_elements = article.query_selector_all("a[href*='/status/']")
                     tweet_id = None
                     for link in link_elements:
@@ -107,12 +116,15 @@ def collect_posts():
                         if match:
                             tweet_id = match.group(1)
                             break
+
                     if not tweet_id or tweet_id in seen:
                         continue
                     seen.add(tweet_id)
+
                     time_el = article.query_selector("time")
                     published_at = time_el.get_attribute("datetime") if time_el else None
                     views = extract_views_from_text(text)
+
                     posts.append({
                         "url": f"https://x.com/{HANDLE}/status/{tweet_id}",
                         "published_at": published_at,
@@ -120,13 +132,17 @@ def collect_posts():
                         "text": text[:120].replace("\n", " "),
                     })
                     print(f"found post: {tweet_id} published_at={published_at} views={views}")
+
                 except Exception as error:
                     print(f"skip article: {error}")
+
             page.mouse.wheel(0, 2500)
             page.wait_for_timeout(2500)
+
         page.screenshot(path="x_debug_after_scroll.png", full_page=True)
         print("saved screenshot: x_debug_after_scroll.png")
         browser.close()
+
     return posts
 
 
@@ -157,6 +173,7 @@ def notion_create(post):
     }
     if post["views"] is not None:
         properties["Metric"] = {"number": post["views"]}
+
     payload = json.dumps({"parent": {"database_id": DATABASE_ID}, "properties": properties}).encode("utf-8")
     request = urllib.request.Request(
         "https://api.notion.com/v1/pages",
@@ -180,8 +197,10 @@ def notion_create(post):
 def main():
     posts = collect_posts()
     print(f"raw posts: {len(posts)}")
+
     kept = filter_posts(posts)
-    print(f"after age filter (1.5–5 days): {len(kept)}")
+    print(f"after age filter (1.5-5 days): {len(kept)}")
+
     saved = 0
     no_views = 0
     for post in kept:
@@ -189,6 +208,7 @@ def main():
             saved += 1
             if post["views"] is None:
                 no_views += 1
+
     print(f"saved={saved}, no_views={no_views}")
     if saved == 0:
         print("verdict: no qualifying posts saved")
