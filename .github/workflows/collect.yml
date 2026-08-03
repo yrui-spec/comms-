@@ -1,22 +1,24 @@
-name: Collect X metrics
+name: Collect X analytics
 
 on:
+  schedule:
+    # 06:00 UTC = 09:00 Kyiv (summer / EEST).
+    # NOTE: GitHub cron is always UTC and does NOT follow DST.
+    # In winter (EET, UTC+2) this fires at 08:00 Kyiv. Change to "0 7 * * *" if you want 09:00 all year in winter.
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       target_date:
-        description: "Exact date YYYY-MM-DD"
-        required: true
-        default: "2026-07-28"
-      save_limit:
-        description: "How many rows to save; 0 = all"
-        required: true
-        default: "10"
+        description: "Collect a specific day (YYYY-MM-DD). Leave empty for auto = today − 3 days."
+        required: false
+        default: ""
 
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -35,19 +37,19 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
           CONTENT_PULSE_DATABASE_ID: ${{ secrets.CONTENT_PULSE_DATABASE_ID }}
+          COLLECTION_RUNS_DATABASE_ID: ${{ secrets.COLLECTION_RUNS_DATABASE_ID }}
           X_COOKIES_JSON: ${{ secrets.X_COOKIES_JSON }}
           X_HANDLE: Mylovanov
-          TARGET_DATE: ${{ github.event.inputs.target_date || '2026-07-28' }}
-          SAVE_LIMIT: ${{ github.event.inputs.save_limit || '10' }}
-          MAX_SCROLLS: "500"
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+          LOOKBACK_DAYS: "3"
+          MATCH_THRESHOLD: "0.6"
+          MAX_SCROLLS: "80"
         run: python x_pilot.py
 
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: x-debug-screenshots
-          path: |
-            x_debug_home.png
-            x_debug_after_scroll.png
+          name: debug-screenshots
+          path: debug/
           if-no-files-found: ignore
