@@ -1,205 +1,266 @@
-"""
-X scroll diagnostic — screenshot version.
-
-Purpose:
-- Check whether GitHub/Playwright can scroll deeper in @Mylovanov's X profile.
-- Save screenshots at the start, middle, and end.
-- Print how many unique posts were found and which dates were reached.
-- Does NOT write anything to Notion.
-
-Required GitHub Secret:
-- X_COOKIES_JSON
-
-Optional env:
-- X_HANDLE
-- MAX_SCROLLS
-"""
-
-import json
 import os
 import re
-from collections import Counter
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
-
+import json
+import time
+import requests
+from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
+DATABASE_ID = os.getenv("DATABASE_ID", "").strip().replace("-", "")
+X_HANDLE = os.getenv("X_HANDLE", "Mylovanov").strip().lstrip("@")
+X_COOKIES_JSON = os.getenv("X_COOKIES_JSON", "").strip()
 
-HANDLE = os.environ.get("X_HANDLE", "Mylovanov")
-X_COOKIES_JSON = os.environ.get("X_COOKIES_JSON", "")
-MAX_SCROLLS = int(os.environ.get("MAX_SCROLLS", "80"))
-SCROLL_PAUSE_MS = int(os.environ.get("SCROLL_PAUSE_MS", "2000"))
+# Test safety: set SAVE_LIMIT=10 in workflow while testing. Empty/0 = no limit.
+SAVE_LIMIT = int(os.getenv("SAVE_LIMIT", "10").strip() or "0")
+MAX_SCROLLS = int(os.getenv("MAX_SCROLLS", "220").strip() or "220")
 
+# Collect posts older than 36h, but not older than 7 days.
+NOW = datetime.now(timezone.utc)
+TARGET_END = NOW - timedelta(hours=36)
+TARGET_START = NOW - timedelta(days=7)
 
-def normalize_cookies(raw: str) -> List[Dict]:
-    if not raw:
-        raise RuntimeError("X_COOKIES_JSON is missing")
-
-    cookies = json.loads(raw)
-    normalized = []
-
-    for cookie in cookies:
-        name = cookie.get("name")
-        value = cookie.get("value")
-        if not name or value is None:
-            continue
-
-        normalized.append(
-            {
-                "name": name,
-                "value": value,
-                "domain": cookie.get("domain") or ".x.com",
-                "path": cookie.get("path") or "/",
-                "httpOnly": bool(cookie.get("httpOnly", False)),
-                "secure": True,
-                "sameSite": cookie.get("sameSite", "Lax"),
-            }
-        )
-
-    return normalized
+NOTION_VERSION = "2022-06-28"
 
 
-def parse_published_at(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+def clean_id(value: str) -> str:
+    value = (value or "").strip()
+    # If user pasted Notion URL, extract 32-char UUID-ish tail.
+    m = re.findall(r"[0-9a-fA-F]{32}", value.replace("-", ""))
+    if m:
+        return m[-1]
+    return value.replace("-", "")
+
+DATABASE_ID = clean_id(DATABASE_ID)
+
+
+def parse_views(text: str):
+    if not text:
         return None
+    text = text.replace("\u202f", " ").replace("\xa0", " ")
+    patterns = [
+        r"([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)\s+(?:Views|views|перегляд|перегляди|переглядів)",
+        r"(?:Views|views|перегляди|переглядів)\s*[:·]?\s*([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)",
+    ]
+    for p in patterns:
+        m = re.search(p, text)
+        if m:
+            return normalize_number(m.group(1))
+    return None
+
+
+def normalize_number(s: str):
+    s = s.strip().replace(" ", "").replace(",", ".")
+    mult = 1
+    if s[-1:].upper() in ["K", "К"]:
+        mult = 1_000
+        s = s[:-1]
+    elif s[-1:].upper() in ["M", "М"]:
+        mult = 1_000_000
+        s = s[:-1]
+    elif s[-1:].upper() in ["B", "Б"]:
+        mult = 1_000_000_000
+        s = s[:-1]
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(float(s) * mult)
     except Exception:
         return None
 
 
-def collect_visible_posts(page, posts_by_id: Dict[str, Dict]) -> int:
-    new_count = 0
-    articles = page.query_selector_all("article")
-
-    for article in articles:
-        try:
-            link_elements = article.query_selector_all("a[href*='/status/']")
-            tweet_id = None
-
-            for link in link_elements:
-                href = link.get_attribute("href") or ""
-                match = re.search(r"/status/(\d+)", href)
-                if match:
-                    tweet_id = match.group(1)
-                    break
-
-            if not tweet_id or tweet_id in posts_by_id:
-                continue
-
-            time_el = article.query_selector("time")
-            published_at = time_el.get_attribute("datetime") if time_el else None
-            published_dt = parse_published_at(published_at)
-
-            posts_by_id[tweet_id] = {
-                "tweet_id": tweet_id,
-                "published_at": published_at,
-                "published_dt": published_dt,
-            }
-            new_count += 1
-
-        except Exception as error:
-            print(f"skip article: {error}")
-
-    return new_count
+def post_url(post_id: str):
+    return f"https://x.com/{X_HANDLE}/status/{post_id}"
 
 
-def summarize_dates(posts_by_id: Dict[str, Dict]) -> None:
-    dated = [post for post in posts_by_id.values() if post.get("published_dt")]
+def notion_headers():
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
 
-    if not dated:
-        print("date summary: no dated posts found")
+
+def load_database_props():
+    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}"
+    r = requests.get(url, headers=notion_headers(), timeout=30)
+    if r.status_code != 200:
+        print(f"notion database load error {r.status_code}: {r.text}")
+        return {}
+    props = r.json().get("properties", {})
+    print("loaded Notion database properties:", ", ".join(props.keys()))
+    return props
+
+
+def prop_payload(props, name, value):
+    if name not in props or value is None:
+        return None
+    typ = props[name]["type"]
+    if typ == "title":
+        return {"title": [{"text": {"content": str(value)[:2000]}}]}
+    if typ == "rich_text":
+        return {"rich_text": [{"text": {"content": str(value)[:2000]}}]}
+    if typ == "number":
+        return {"number": int(value)}
+    if typ == "url":
+        return {"url": str(value)}
+    if typ == "date":
+        return {"date": {"start": str(value)}}
+    if typ == "select":
+        return {"select": {"name": str(value)}}
+    if typ == "status":
+        return {"status": {"name": str(value)}}
+    return None
+
+
+def save_to_notion(item, props):
+    properties = {}
+    mapping = {
+        "Post": f"X post {item['id']}",
+        "Channel": "X",
+        "Published at": item["published_at"],
+        "Metric type": "Views",
+        "Metric": item["views"],
+        "Post URL": item["url"],
+        "Run status": "Views captured",
+    }
+    for k, v in mapping.items():
+        payload = prop_payload(props, k, v)
+        if payload:
+            properties[k] = payload
+
+    body = {"parent": {"database_id": DATABASE_ID}, "properties": properties}
+    r = requests.post("https://api.notion.com/v1/pages", headers=notion_headers(), json=body, timeout=30)
+    if r.status_code not in (200, 201):
+        print(f"notion error {r.status_code}: {r.text}")
+        return False
+    print(f"saved to Notion: {item['id']} views={item['views']}")
+    return True
+
+
+def add_cookies(context):
+    if not X_COOKIES_JSON:
+        print("no cookies provided")
         return
+    try:
+        cookies = json.loads(X_COOKIES_JSON)
+        if isinstance(cookies, dict):
+            cookies = cookies.get("cookies", [])
+        fixed = []
+        for c in cookies:
+            if "sameSite" in c and c["sameSite"] not in ["Strict", "Lax", "None"]:
+                c.pop("sameSite", None)
+            if "domain" not in c:
+                c["domain"] = ".x.com"
+            if "path" not in c:
+                c["path"] = "/"
+            fixed.append(c)
+        context.add_cookies(fixed)
+        print(f"loaded cookies: {len(fixed)}")
+    except Exception as e:
+        print("cookies error:", repr(e))
 
-    newest = max(post["published_dt"] for post in dated)
-    oldest = min(post["published_dt"] for post in dated)
-    counts = Counter(post["published_dt"].date().isoformat() for post in dated)
 
-    print(f"newest collected: {newest.isoformat()}")
-    print(f"oldest collected: {oldest.isoformat()}")
-    print("date counts:")
-    for day, count in sorted(counts.items(), reverse=True):
-        print(f"  {day}: {count}")
+def extract_post(article):
+    try:
+        links = article.locator("a[href*='/status/']").evaluate_all("els => els.map(a => a.href)")
+        ids = []
+        for href in links:
+            m = re.search(r"/status/(\d+)", href)
+            if m:
+                ids.append(m.group(1))
+        if not ids:
+            return None
+        post_id = ids[0]
+
+        times = article.locator("time").evaluate_all("els => els.map(t => t.getAttribute('datetime'))")
+        if not times:
+            return None
+        published_at = times[0]
+        dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+
+        text = article.inner_text(timeout=3000)
+        aria = article.evaluate("""el => Array.from(el.querySelectorAll('[aria-label]')).map(x => x.getAttribute('aria-label')).filter(Boolean).join(' | ')""")
+        views = parse_views(text) or parse_views(aria)
+        if views is None:
+            return None
+        if views > 20_000_000:  # guard against parser grabbing wrong huge numbers
+            print(f"skip suspicious views: {post_id} views={views}")
+            return None
+
+        return {"id": post_id, "published_at": published_at, "dt": dt, "views": views, "url": post_url(post_id)}
+    except Exception as e:
+        print("extract error:", repr(e))
+        return None
 
 
-def main() -> None:
-    posts_by_id: Dict[str, Dict] = {}
+def main():
+    if not NOTION_TOKEN:
+        raise RuntimeError("Missing NOTION_TOKEN")
+    if not DATABASE_ID or not re.fullmatch(r"[0-9a-fA-F]{32}", DATABASE_ID):
+        raise RuntimeError(f"Bad DATABASE_ID after cleanup: {DATABASE_ID!r}")
 
+    print(f"opening https://x.com/{X_HANDLE}")
+    print(f"target date range: {TARGET_START.date()} through {TARGET_END.date()}")
+    print(f"save limit: {SAVE_LIMIT}")
+
+    seen = {}
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 1400},
-            locale="en-US",
-        )
-
-        cookies = normalize_cookies(X_COOKIES_JSON)
-        context.add_cookies(cookies)
-        print(f"loaded cookies: {len(cookies)}")
-
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1400, "height": 1800})
+        add_cookies(context)
         page = context.new_page()
-        url = f"https://x.com/{HANDLE}"
-        print(f"opening {url}")
-        print(f"diagnostic max scrolls: {MAX_SCROLLS}")
+        page.goto(f"https://x.com/{X_HANDLE}", wait_until="domcontentloaded", timeout=60000)
+        time.sleep(5)
+        page.screenshot(path="x_debug_home.png", full_page=True)
+        print("saved screenshot: x_debug_home.png")
 
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(8000)
-
-        collect_visible_posts(page, posts_by_id)
-        page.screenshot(path="x_debug_00_start.png", full_page=True)
-        print("saved screenshot: x_debug_00_start.png")
-        print(f"scroll -1: raw={len(posts_by_id)}")
-
-        no_new_streak = 0
-
-        for scroll_index in range(MAX_SCROLLS):
-            before = len(posts_by_id)
-
-            page.mouse.wheel(0, 3500)
-            page.wait_for_timeout(SCROLL_PAUSE_MS)
-
-            new_count = collect_visible_posts(page, posts_by_id)
-            after = len(posts_by_id)
-
-            if after == before:
-                no_new_streak += 1
+        no_new = 0
+        for scroll in range(MAX_SCROLLS):
+            articles = page.locator("article")
+            count = articles.count()
+            new_this = 0
+            for i in range(count):
+                item = extract_post(articles.nth(i))
+                if item and item["id"] not in seen:
+                    seen[item["id"]] = item
+                    new_this += 1
+                    print(f"found post: {item['id']} published_at={item['published_at']} views={item['views']}")
+            print(f"scroll {scroll}: article nodes={count}, raw={len(seen)}, new_this_scroll={new_this}")
+            if new_this == 0:
+                no_new += 1
             else:
-                no_new_streak = 0
-
-            dated = [post for post in posts_by_id.values() if post.get("published_dt")]
-            oldest = min((post["published_dt"] for post in dated), default=None)
-            oldest_text = oldest.isoformat() if oldest else "none"
-
-            print(
-                f"scroll {scroll_index}: raw={after}, new={new_count}, "
-                f"no_new_streak={no_new_streak}, oldest={oldest_text}"
-            )
-
-            if scroll_index == 20:
-                page.screenshot(path="x_debug_20_scrolls.png", full_page=True)
-                print("saved screenshot: x_debug_20_scrolls.png")
-
-            if scroll_index == 50:
-                page.screenshot(path="x_debug_50_scrolls.png", full_page=True)
-                print("saved screenshot: x_debug_50_scrolls.png")
-
-            if no_new_streak >= 12:
-                print("stop: X stopped loading new posts")
+                no_new = 0
+            if no_new >= 10:
+                print("stop: no new posts after repeated scrolls")
                 break
+            page.mouse.wheel(0, 3500)
+            time.sleep(2)
 
-        page.screenshot(path="x_debug_final.png", full_page=True)
-        print("saved screenshot: x_debug_final.png")
+        page.screenshot(path="x_debug_after_scroll.png", full_page=True)
+        print("saved screenshot: x_debug_after_scroll.png")
         browser.close()
 
-    print(f"raw posts total: {len(posts_by_id)}")
-    summarize_dates(posts_by_id)
-    print("verdict: diagnostic complete — check screenshots artifact")
+    all_posts = list(seen.values())
+    qualified = [x for x in all_posts if TARGET_START <= x["dt"] <= TARGET_END]
+    qualified.sort(key=lambda x: x["dt"], reverse=True)
+    print(f"raw posts: {len(all_posts)}")
+    print(f"posts in requested date range: {len(qualified)}")
+    for q in qualified[:25]:
+        print(f"qualified: {q['id']} {q['published_at']} views={q['views']}")
+
+    if SAVE_LIMIT > 0:
+        qualified = qualified[:SAVE_LIMIT]
+        print(f"limited qualified for test: {len(qualified)}")
+
+    props = load_database_props()
+    saved = 0
+    for item in qualified:
+        if save_to_notion(item, props):
+            saved += 1
+    print(f"saved={saved}, attempted={len(qualified)}")
+    if saved:
+        print("verdict: saved to Notion")
+    else:
+        print("verdict: posts found, but none saved to Notion")
 
 
 if __name__ == "__main__":
