@@ -5,11 +5,12 @@ X analytics collector — Phase 1.1
 What it does (once per run):
   1. Resolves a target day (default: today − 3 days, Kyiv time).
   2. Opens an X search for @HANDLE posts from that exact day (replies excluded).
-  3. For every post: extracts URL, Post ID, timestamp, text and views.
-  4. Upserts a row in the Post Outputs Notion DB (by Post ID — no duplicates).
-  5. Freezes the metric (views) once; never overwrites a frozen metric.
-  6. Matches the post to a Content Pulse draft by PAGE-BODY text (fuzzy).
-  7. Logs the whole run into the Collection Runs DB.
+  3. Keeps only posts that belong to the target day in Kyiv time.
+  4. For every post: extracts URL, Post ID, timestamp, text and views.
+  5. Upserts a row in the Post Outputs Notion DB (by Post ID — no duplicates).
+  6. Freezes the metric (views) once; never overwrites a frozen metric.
+  7. Matches the post to a Content Pulse draft by PAGE-BODY text (fuzzy).
+  8. Logs the whole run into the Collection Runs DB.
 
 All config comes from environment variables / GitHub Secrets.
 """
@@ -58,7 +59,7 @@ def clean_id(v: str) -> str:
 
 def headers() -> dict:
     return {
-        "Authorization": f"Bearer {TOKEN}",
+        "Authorization": "Bearer " + TOKEN,
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
@@ -70,11 +71,22 @@ def resolve_target_date():
     return datetime.now(KYIV).date() - timedelta(days=LOOKBACK_DAYS)
 
 
+def kyiv_date(iso):
+    """Convert an ISO timestamp (usually UTC) to a Kyiv calendar date."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone(KYIV).date()
+    except Exception:
+        return None
+
+
 # ----------------------------- Scraping -------------------------------------
 def build_search_url(day) -> str:
     since = day.isoformat()
     until = (day + timedelta(days=1)).isoformat()
-    q = f"from:{X_HANDLE} since:{since} until:{until} -filter:replies"
+    q = "from:" + X_HANDLE + " since:" + since + " until:" + until + " -filter:replies"
     return "https://x.com/search?q=" + quote(q) + "&src=typed_query&f=live"
 
 
@@ -198,7 +210,7 @@ def scrape_posts(day):
 # ----------------------------- Notion I/O -----------------------------------
 def find_existing(post_id):
     r = requests.post(
-        f"{NOTION_API}/databases/{clean_id(POST_OUTPUTS_DB)}/query",
+        NOTION_API + "/databases/" + clean_id(POST_OUTPUTS_DB) + "/query",
         headers=headers(),
         json={"filter": {"property": "Post ID",
                           "rich_text": {"equals": post_id}}, "page_size": 1},
@@ -209,7 +221,7 @@ def find_existing(post_id):
 
 
 def build_props(post, match):
-    title = post["text"][:120] if post["text"] else f"X post {post['post_id']}"
+    title = post["text"][:120] if post["text"] else ("X post " + post["post_id"])
     props = {
         "Post": {"title": [{"text": {"content": title}}]},
         "Post ID": {"rich_text": [{"text": {"content": post["post_id"]}}]},
@@ -236,7 +248,7 @@ def create_row(props, unmatched):
     payload = {"parent": {"database_id": clean_id(POST_OUTPUTS_DB)}, "properties": props}
     if unmatched:
         payload["icon"] = {"type": "emoji", "emoji": "🔴"}
-    r = requests.post(f"{NOTION_API}/pages", headers=headers(), json=payload)
+    r = requests.post(NOTION_API + "/pages", headers=headers(), json=payload)
     r.raise_for_status()
 
 
@@ -249,7 +261,7 @@ def update_row(page, props, unmatched):
     payload = {"properties": props}
     if unmatched:
         payload["icon"] = {"type": "emoji", "emoji": "🔴"}
-    r = requests.patch(f"{NOTION_API}/pages/{page['id']}", headers=headers(), json=payload)
+    r = requests.patch(NOTION_API + "/pages/" + page["id"], headers=headers(), json=payload)
     r.raise_for_status()
     return frozen
 
@@ -268,7 +280,7 @@ def content_pulse_candidates(day):
         if cursor:
             body["start_cursor"] = cursor
         r = requests.post(
-            f"{NOTION_API}/databases/{clean_id(CONTENT_PULSE_DB)}/query",
+            NOTION_API + "/databases/" + clean_id(CONTENT_PULSE_DB) + "/query",
             headers=headers(), json=body)
         r.raise_for_status()
         j = r.json()
@@ -287,9 +299,9 @@ def content_pulse_candidates(day):
 def page_body_text(page_id):
     parts, cursor = [], None
     while True:
-        url = f"{NOTION_API}/blocks/{clean_id(page_id)}/children?page_size=100"
+        url = NOTION_API + "/blocks/" + clean_id(page_id) + "/children?page_size=100"
         if cursor:
-            url += f"&start_cursor={cursor}"
+            url += "&start_cursor=" + cursor
         r = requests.get(url, headers=headers())
         if r.status_code != 200:
             break
@@ -328,7 +340,7 @@ def log_run(day, stats, status, notes):
     if not RUNS_DB:
         return
     props = {
-        "Run": {"title": [{"text": {"content": f"X · {day.isoformat()}"}}]},
+        "Run": {"title": [{"text": {"content": "X · " + day.isoformat()}}]},
         "Run at": {"date": {"start": datetime.now(KYIV).isoformat()}},
         "Target date": {"date": {"start": day.isoformat()}},
         "Status": {"select": {"name": status}},
@@ -342,7 +354,7 @@ def log_run(day, stats, status, notes):
     if notes:
         props["Errors / notes"] = {"rich_text": [{"text": {"content": notes[:1900]}}]}
     try:
-        requests.post(f"{NOTION_API}/pages", headers=headers(),
+        requests.post(NOTION_API + "/pages", headers=headers(),
                       json={"parent": {"database_id": clean_id(RUNS_DB)},
                             "properties": props})
     except Exception as e:
@@ -356,7 +368,7 @@ def main():
         sys.exit(1)
 
     day = resolve_target_date()
-    print(f"Target date (Kyiv): {day}")
+    print("Target date (Kyiv):", day)
     stats = {"found": 0, "created": 0, "updated": 0,
              "frozen": 0, "matched": 0, "review": 0}
     notes = []
@@ -365,12 +377,21 @@ def main():
     try:
         posts = scrape_posts(day)
     except Exception as e:
-        log_run(day, stats, "❌ Failed", f"Scrape error: {e}")
+        log_run(day, stats, "❌ Failed", "Scrape error: " + str(e))
         print("Scrape failed:", e)
         sys.exit(1)
 
+    # X search boundaries are UTC, so a few early-morning posts from the
+    # NEXT Kyiv day leak in. Keep only posts that belong to the target day
+    # in Kyiv time — this also prevents freezing a metric before 72h.
+    raw_count = len(posts)
+    posts = [p for p in posts if kyiv_date(p.get("published_at")) == day]
+    dropped = raw_count - len(posts)
+    if dropped:
+        print("Dropped", dropped, "post(s) outside the target Kyiv day")
+
     stats["found"] = len(posts)
-    print(f"Found {len(posts)} posts")
+    print("Found", len(posts), "posts for", day, "(Kyiv)")
     if not posts:
         log_run(day, stats, "❌ Failed",
                 "0 posts found — cookies may be expired or the day is empty.")
@@ -383,7 +404,7 @@ def main():
             for pg in content_pulse_candidates(day):
                 cand_bodies.append((pg, page_body_text(pg["id"])))
     except Exception as e:
-        notes.append(f"Content Pulse query error: {e}")
+        notes.append("Content Pulse query error: " + str(e))
         status = "⚠️ Warning"
 
     for post in posts:
@@ -414,10 +435,10 @@ def main():
             else:
                 stats["review"] += 1
         except requests.HTTPError as e:
-            notes.append(f"{post['post_id']}: {e.response.text[:200]}")
+            notes.append(post["post_id"] + ": " + e.response.text[:200])
             status = "⚠️ Warning"
         except Exception as e:
-            notes.append(f"{post['post_id']}: {e}")
+            notes.append(post["post_id"] + ": " + str(e))
             status = "⚠️ Warning"
 
     log_run(day, stats, status, " | ".join(notes))
