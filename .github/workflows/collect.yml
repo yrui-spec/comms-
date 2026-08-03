@@ -28,3 +28,13 @@ jobs:
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
           X_HANDLE: Mylovanov
         run: python x_pilot.py
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x-debug-screenshots
+          path: |
+            x_debug_home.png
+            x_debug_after_scroll.png
+          if-no-files-found: ignore
