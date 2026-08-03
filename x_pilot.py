@@ -1,112 +1,49 @@
 """
-X metrics collector — date-window version.
+X scroll diagnostic — screenshot version.
 
-Task:
-- Open @Mylovanov on X as a logged-in browser using X_COOKIES_JSON.
-- Scroll chronologically down the profile.
-- Skip posts newer than the requested window.
-- Save posts from 2026-07-27 through 2026-08-01.
-- Stop only after the feed has clearly reached 2026-07-26 or older.
+Purpose:
+- Check whether GitHub/Playwright can scroll deeper in @Mylovanov's X profile.
+- Save screenshots at the start, middle, and end.
+- Print how many unique posts were found and which dates were reached.
+- Does NOT write anything to Notion.
 
-Required GitHub Secrets:
-- NOTION_TOKEN
-- DATABASE_ID
+Required GitHub Secret:
 - X_COOKIES_JSON
 
-Optional GitHub env:
+Optional env:
 - X_HANDLE
-- START_DATE
-- END_DATE
-- STOP_DATE
 - MAX_SCROLLS
 """
 
 import json
 import os
 import re
-import urllib.error
-import urllib.request
-from datetime import datetime, date, time, timezone
+from collections import Counter
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from playwright.sync_api import sync_playwright
 
 
 HANDLE = os.environ.get("X_HANDLE", "Mylovanov")
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-DATABASE_ID = os.environ["DATABASE_ID"]
 X_COOKIES_JSON = os.environ.get("X_COOKIES_JSON", "")
-
-START_DATE_TEXT = os.environ.get("START_DATE", "2026-07-27")
-END_DATE_TEXT = os.environ.get("END_DATE", "2026-08-01")
-STOP_DATE_TEXT = os.environ.get("STOP_DATE", "2026-07-26")
-
-START_DATE = date.fromisoformat(START_DATE_TEXT)
-END_DATE = date.fromisoformat(END_DATE_TEXT)
-STOP_DATE = date.fromisoformat(STOP_DATE_TEXT)
-
-START_DT = datetime.combine(START_DATE, time.min, tzinfo=timezone.utc)
-END_DT = datetime.combine(END_DATE, time.max, tzinfo=timezone.utc)
-STOP_DT = datetime.combine(STOP_DATE, time.max, tzinfo=timezone.utc)
-
-MAX_SCROLLS = int(os.environ.get("MAX_SCROLLS", "220"))
-SCROLL_PAUSE_MS = int(os.environ.get("SCROLL_PAUSE_MS", "1800"))
-MAX_ROWS = int(os.environ.get("MAX_ROWS", "1000"))
-
-# Stop only when we repeatedly see newly discovered posts from STOP_DATE or older.
-# This avoids stopping on a pinned/old post at the top of the profile.
-OLD_POSTS_NEEDED_TO_STOP = int(os.environ.get("OLD_POSTS_NEEDED_TO_STOP", "8"))
-MIN_TARGET_OR_RECENT_BEFORE_STOP = int(os.environ.get("MIN_TARGET_OR_RECENT_BEFORE_STOP", "30"))
-
-
-PROPERTY_CANDIDATES = {
-    "title": ["Post", "Content Pulse Item", "Name", "title"],
-    "channel": ["Channel"],
-    "post_url": ["Post URL"],
-    "published_at": ["Published at", "Date"],
-    "metric": ["Metric", "Views"],
-    "run_status": ["Run status"],
-}
-
-
-def parse_number(text: str) -> Optional[int]:
-    if not text:
-        return None
-    cleaned = text.strip().replace(",", "").replace(" ", "")
-    match = re.match(r"^(\d+(?:\.\d+)?)([KMB]?)$", cleaned, re.IGNORECASE)
-    if not match:
-        return None
-    number = float(match.group(1))
-    suffix = match.group(2).upper()
-    multiplier = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suffix]
-    return int(number * multiplier)
-
-
-def extract_views_from_text(text: str) -> Optional[int]:
-    if not text:
-        return None
-    candidates = re.findall(r"\b\d+(?:[.,]\d+)?[KMB]?\b", text, flags=re.IGNORECASE)
-    values = []
-    for candidate in candidates:
-        value = parse_number(candidate.replace(",", "."))
-        if value is not None:
-            values.append(value)
-    if not values:
-        return None
-    # On X cards, views are usually the largest compact number in the visible text.
-    return max(values)
+MAX_SCROLLS = int(os.environ.get("MAX_SCROLLS", "80"))
+SCROLL_PAUSE_MS = int(os.environ.get("SCROLL_PAUSE_MS", "2000"))
 
 
 def normalize_cookies(raw: str) -> List[Dict]:
     if not raw:
         raise RuntimeError("X_COOKIES_JSON is missing")
+
     cookies = json.loads(raw)
     normalized = []
+
     for cookie in cookies:
         name = cookie.get("name")
         value = cookie.get("value")
         if not name or value is None:
             continue
+
         normalized.append(
             {
                 "name": name,
@@ -118,6 +55,7 @@ def normalize_cookies(raw: str) -> List[Dict]:
                 "sameSite": cookie.get("sameSite", "Lax"),
             }
         )
+
     return normalized
 
 
@@ -130,25 +68,62 @@ def parse_published_at(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def in_target_range(dt: datetime) -> bool:
-    return START_DT <= dt <= END_DT
+def collect_visible_posts(page, posts_by_id: Dict[str, Dict]) -> int:
+    new_count = 0
+    articles = page.query_selector_all("article")
+
+    for article in articles:
+        try:
+            link_elements = article.query_selector_all("a[href*='/status/']")
+            tweet_id = None
+
+            for link in link_elements:
+                href = link.get_attribute("href") or ""
+                match = re.search(r"/status/(\d+)", href)
+                if match:
+                    tweet_id = match.group(1)
+                    break
+
+            if not tweet_id or tweet_id in posts_by_id:
+                continue
+
+            time_el = article.query_selector("time")
+            published_at = time_el.get_attribute("datetime") if time_el else None
+            published_dt = parse_published_at(published_at)
+
+            posts_by_id[tweet_id] = {
+                "tweet_id": tweet_id,
+                "published_at": published_at,
+                "published_dt": published_dt,
+            }
+            new_count += 1
+
+        except Exception as error:
+            print(f"skip article: {error}")
+
+    return new_count
 
 
-def is_newer_than_target(dt: datetime) -> bool:
-    return dt > END_DT
+def summarize_dates(posts_by_id: Dict[str, Dict]) -> None:
+    dated = [post for post in posts_by_id.values() if post.get("published_dt")]
+
+    if not dated:
+        print("date summary: no dated posts found")
+        return
+
+    newest = max(post["published_dt"] for post in dated)
+    oldest = min(post["published_dt"] for post in dated)
+    counts = Counter(post["published_dt"].date().isoformat() for post in dated)
+
+    print(f"newest collected: {newest.isoformat()}")
+    print(f"oldest collected: {oldest.isoformat()}")
+    print("date counts:")
+    for day, count in sorted(counts.items(), reverse=True):
+        print(f"  {day}: {count}")
 
 
-def is_stop_or_older(dt: datetime) -> bool:
-    return dt <= STOP_DT
-
-
-def collect_posts() -> List[Dict]:
+def main() -> None:
     posts_by_id: Dict[str, Dict] = {}
-    old_stop_posts_seen = 0
-    target_or_recent_seen = 0
-    consecutive_no_new = 0
-    newest_seen: Optional[datetime] = None
-    oldest_seen: Optional[datetime] = None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -171,268 +146,60 @@ def collect_posts() -> List[Dict]:
         page = context.new_page()
         url = f"https://x.com/{HANDLE}"
         print(f"opening {url}")
-        print(f"target date range: {START_DATE_TEXT} through {END_DATE_TEXT}")
-        print(f"stop after real feed reaches: {STOP_DATE_TEXT} or older")
-        print(f"max scrolls: {MAX_SCROLLS}")
+        print(f"diagnostic max scrolls: {MAX_SCROLLS}")
 
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(8000)
-        page.screenshot(path="x_debug_home.png", full_page=True)
-        print("saved screenshot: x_debug_home.png")
+
+        collect_visible_posts(page, posts_by_id)
+        page.screenshot(path="x_debug_00_start.png", full_page=True)
+        print("saved screenshot: x_debug_00_start.png")
+        print(f"scroll -1: raw={len(posts_by_id)}")
+
+        no_new_streak = 0
 
         for scroll_index in range(MAX_SCROLLS):
-            before_count = len(posts_by_id)
-            new_this_scroll = 0
-            old_this_scroll = 0
-            target_this_scroll = 0
+            before = len(posts_by_id)
 
-            articles = page.query_selector_all("article")
-            print(f"scroll {scroll_index}: article nodes={len(articles)}")
-
-            for article in articles:
-                try:
-                    text = article.inner_text()
-                    link_elements = article.query_selector_all("a[href*='/status/']")
-
-                    tweet_id = None
-                    for link in link_elements:
-                        href = link.get_attribute("href") or ""
-                        match = re.search(r"/status/(\d+)", href)
-                        if match:
-                            tweet_id = match.group(1)
-                            break
-
-                    if not tweet_id or tweet_id in posts_by_id:
-                        continue
-
-                    time_el = article.query_selector("time")
-                    published_at = time_el.get_attribute("datetime") if time_el else None
-                    published_dt = parse_published_at(published_at)
-                    views = extract_views_from_text(text)
-
-                    posts_by_id[tweet_id] = {
-                        "tweet_id": tweet_id,
-                        "url": f"https://x.com/{HANDLE}/status/{tweet_id}",
-                        "published_at": published_at,
-                        "published_dt": published_dt,
-                        "views": views,
-                        "text": text[:240].replace("\n", " "),
-                    }
-
-                    new_this_scroll += 1
-
-                    if published_dt:
-                        if newest_seen is None or published_dt > newest_seen:
-                            newest_seen = published_dt
-                        if oldest_seen is None or published_dt < oldest_seen:
-                            oldest_seen = published_dt
-
-                        if in_target_range(published_dt):
-                            target_this_scroll += 1
-                            target_or_recent_seen += 1
-                        elif is_newer_than_target(published_dt):
-                            target_or_recent_seen += 1
-                        elif is_stop_or_older(published_dt):
-                            # Count old posts only after we have seen enough normal recent/feed posts.
-                            # This protects against a pinned old post near the top.
-                            if target_or_recent_seen >= MIN_TARGET_OR_RECENT_BEFORE_STOP:
-                                old_stop_posts_seen += 1
-                                old_this_scroll += 1
-
-                    print(
-                        f"found post: {tweet_id} published_at={published_at} views={views}"
-                    )
-
-                except Exception as error:
-                    print(f"skip article: {error}")
-
-            after_count = len(posts_by_id)
-            if after_count == before_count:
-                consecutive_no_new += 1
-            else:
-                consecutive_no_new = 0
-
-            total_target = sum(
-                1
-                for post in posts_by_id.values()
-                if post["published_dt"] and in_target_range(post["published_dt"])
-            )
-            newest_text = newest_seen.isoformat() if newest_seen else "none"
-            oldest_text = oldest_seen.isoformat() if oldest_seen else "none"
-            print(
-                "progress: "
-                f"raw={after_count}, new_this_scroll={new_this_scroll}, "
-                f"target_total={total_target}, target_this_scroll={target_this_scroll}, "
-                f"old_stop_seen={old_stop_posts_seen}, old_this_scroll={old_this_scroll}, "
-                f"newest_seen={newest_text}, oldest_seen={oldest_text}"
-            )
-
-            if old_stop_posts_seen >= OLD_POSTS_NEEDED_TO_STOP and total_target > 0:
-                print("stop: feed clearly reached STOP_DATE or older")
-                break
-
-            if consecutive_no_new >= 10:
-                print("stop: no new posts after repeated scrolls")
-                break
-
-            page.mouse.wheel(0, 3200)
+            page.mouse.wheel(0, 3500)
             page.wait_for_timeout(SCROLL_PAUSE_MS)
 
-        page.screenshot(path="x_debug_after_scroll.png", full_page=True)
-        print("saved screenshot: x_debug_after_scroll.png")
+            new_count = collect_visible_posts(page, posts_by_id)
+            after = len(posts_by_id)
+
+            if after == before:
+                no_new_streak += 1
+            else:
+                no_new_streak = 0
+
+            dated = [post for post in posts_by_id.values() if post.get("published_dt")]
+            oldest = min((post["published_dt"] for post in dated), default=None)
+            oldest_text = oldest.isoformat() if oldest else "none"
+
+            print(
+                f"scroll {scroll_index}: raw={after}, new={new_count}, "
+                f"no_new_streak={no_new_streak}, oldest={oldest_text}"
+            )
+
+            if scroll_index == 20:
+                page.screenshot(path="x_debug_20_scrolls.png", full_page=True)
+                print("saved screenshot: x_debug_20_scrolls.png")
+
+            if scroll_index == 50:
+                page.screenshot(path="x_debug_50_scrolls.png", full_page=True)
+                print("saved screenshot: x_debug_50_scrolls.png")
+
+            if no_new_streak >= 12:
+                print("stop: X stopped loading new posts")
+                break
+
+        page.screenshot(path="x_debug_final.png", full_page=True)
+        print("saved screenshot: x_debug_final.png")
         browser.close()
 
-    posts = list(posts_by_id.values())
-    posts.sort(
-        key=lambda item: item["published_dt"] or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
-    return posts
-
-
-def filter_posts(posts: List[Dict]) -> List[Dict]:
-    kept = []
-    for post in posts:
-        dt = post.get("published_dt")
-        if dt and in_target_range(dt):
-            kept.append(post)
-    kept.sort(key=lambda item: item["published_dt"], reverse=True)
-    return kept[:MAX_ROWS]
-
-
-def notion_request(path: str, method: str = "GET", payload: Optional[Dict] = None) -> Dict:
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(
-        f"https://api.notion.com{path}",
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = response.read().decode("utf-8")
-        return json.loads(body) if body else {}
-
-
-def load_database_properties() -> Dict[str, Dict]:
-    database = notion_request(f"/v1/databases/{DATABASE_ID}")
-    return database.get("properties", {})
-
-
-def first_existing_property(properties: Dict[str, Dict], names: List[str]) -> Optional[str]:
-    for name in names:
-        if name in properties:
-            return name
-    return None
-
-
-def find_title_property(properties: Dict[str, Dict]) -> Optional[str]:
-    preferred = first_existing_property(properties, PROPERTY_CANDIDATES["title"])
-    if preferred:
-        return preferred
-    for name, definition in properties.items():
-        if definition.get("type") == "title":
-            return name
-    return None
-
-
-def build_notion_properties(post: Dict, db_properties: Dict[str, Dict]) -> Dict:
-    result = {}
-
-    title_prop = find_title_property(db_properties)
-    if not title_prop:
-        raise RuntimeError("No title property found in Notion database")
-
-    result[title_prop] = {
-        "title": [{"text": {"content": f"@{HANDLE} · {post['tweet_id']}"}}]
-    }
-
-    channel_prop = first_existing_property(db_properties, PROPERTY_CANDIDATES["channel"])
-    if channel_prop:
-        channel_type = db_properties[channel_prop].get("type")
-        if channel_type == "select":
-            result[channel_prop] = {"select": {"name": "X"}}
-        elif channel_type == "multi_select":
-            result[channel_prop] = {"multi_select": [{"name": "X"}]}
-
-    url_prop = first_existing_property(db_properties, PROPERTY_CANDIDATES["post_url"])
-    if url_prop and db_properties[url_prop].get("type") == "url":
-        result[url_prop] = {"url": post["url"]}
-
-    date_prop = first_existing_property(db_properties, PROPERTY_CANDIDATES["published_at"])
-    if date_prop and db_properties[date_prop].get("type") == "date":
-        result[date_prop] = {"date": {"start": post["published_at"]}}
-
-    metric_prop = first_existing_property(db_properties, PROPERTY_CANDIDATES["metric"])
-    if metric_prop and db_properties[metric_prop].get("type") == "number" and post["views"] is not None:
-        result[metric_prop] = {"number": post["views"]}
-
-    run_status_prop = first_existing_property(db_properties, PROPERTY_CANDIDATES["run_status"])
-    if run_status_prop:
-        run_status_type = db_properties[run_status_prop].get("type")
-        status_name = "Views captured" if post["views"] is not None else "No views"
-        if run_status_type == "select":
-            result[run_status_prop] = {"select": {"name": status_name}}
-
-    return result
-
-
-def notion_create(post: Dict, db_properties: Dict[str, Dict]) -> bool:
-    properties = build_notion_properties(post, db_properties)
-    payload = {"parent": {"database_id": DATABASE_ID}, "properties": properties}
-
-    try:
-        notion_request("/v1/pages", method="POST", payload=payload)
-        return True
-    except urllib.error.HTTPError as error:
-        print(f"notion error {error.code}: {error.read().decode(errors='replace')}")
-        return False
-    except Exception as error:
-        print(f"notion error: {error}")
-        return False
-
-
-def main() -> None:
-    posts = collect_posts()
-    print(f"raw posts: {len(posts)}")
-
-    dated_posts = [post for post in posts if post.get("published_dt")]
-    if dated_posts:
-        newest = max(post["published_dt"] for post in dated_posts)
-        oldest = min(post["published_dt"] for post in dated_posts)
-        print(f"newest collected: {newest.isoformat()}")
-        print(f"oldest collected: {oldest.isoformat()}")
-
-    kept = filter_posts(posts)
-    print(f"posts in requested date range ({START_DATE_TEXT}..{END_DATE_TEXT}): {len(kept)}")
-
-    for post in kept[:25]:
-        print(f"qualified: {post['tweet_id']} {post['published_at']} views={post['views']}")
-
-    db_properties = load_database_properties()
-    print(f"loaded Notion database properties: {', '.join(db_properties.keys())}")
-
-    saved = 0
-    no_views = 0
-    for post in kept:
-        if notion_create(post, db_properties):
-            saved += 1
-            if post["views"] is None:
-                no_views += 1
-
-    print(f"saved={saved}, no_views={no_views}")
-
-    if len(kept) == 0:
-        print("verdict: no posts found in requested date range")
-    elif saved == 0:
-        print("verdict: posts found, but none saved to Notion")
-    elif no_views == saved:
-        print("verdict: posts saved, but views were not captured")
-    else:
-        print("verdict: OK — requested date range saved with views")
+    print(f"raw posts total: {len(posts_by_id)}")
+    summarize_dates(posts_by_id)
+    print("verdict: diagnostic complete — check screenshots artifact")
 
 
 if __name__ == "__main__":
