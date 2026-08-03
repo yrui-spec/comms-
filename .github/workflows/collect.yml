@@ -36,6 +36,5 @@ jobs:
         with:
           name: x-debug-screenshots
           path: |
-            x_debug_home.png
-            x_debug_after_scroll.png
-          if-no-files-found: ignore
+            x_debug_*.png
+          if-no-files-found: warn
