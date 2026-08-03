@@ -9,10 +9,9 @@ CONTENT_PULSE_DATABASE_ID = os.getenv("CONTENT_PULSE_DATABASE_ID", "").strip()
 X_HANDLE = os.getenv("X_HANDLE", "Mylovanov").strip().lstrip("@")
 X_COOKIES_JSON = os.getenv("X_COOKIES_JSON", "").strip()
 SAVE_LIMIT = int(os.getenv("SAVE_LIMIT", "10").strip() or "0")
-MAX_SCROLLS = int(os.getenv("MAX_SCROLLS", "220").strip() or "220")
+MAX_SCROLLS = int(os.getenv("MAX_SCROLLS", "260").strip() or "260")
 START_DATE = os.getenv("START_DATE", "2026-07-27").strip()
 END_DATE = os.getenv("END_DATE", "2026-08-01").strip()
-
 NOTION_VERSION = "2022-06-28"
 
 
@@ -35,47 +34,39 @@ def normalize_text(s):
     s = (s or "").lower()
     s = re.sub(r"https?://\S+", " ", s)
     s = re.sub(r"[^\w\sа-яіїєґ'-]", " ", s, flags=re.I)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:800]
+    return re.sub(r"\s+", " ", s).strip()[:800]
 
 
 def similarity(a, b):
     a, b = normalize_text(a), normalize_text(b)
-    if not a or not b:
-        return 0
-    return SequenceMatcher(None, a, b).ratio()
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0
 
 
 def normalize_number(s):
     s = s.strip().replace(" ", "").replace(",", ".")
     mult = 1
-    if s[-1:].upper() in ["K", "К"]:
-        mult, s = 1000, s[:-1]
-    elif s[-1:].upper() in ["M", "М"]:
-        mult, s = 1000000, s[:-1]
-    elif s[-1:].upper() in ["B", "Б"]:
-        mult, s = 1000000000, s[:-1]
-    try:
-        return int(float(s) * mult)
-    except Exception:
-        return None
+    if s[-1:].upper() in ["K", "К"]: mult, s = 1000, s[:-1]
+    elif s[-1:].upper() in ["M", "М"]: mult, s = 1000000, s[:-1]
+    elif s[-1:].upper() in ["B", "Б"]: mult, s = 1000000000, s[:-1]
+    try: return int(float(s) * mult)
+    except Exception: return None
 
 
 def parse_views(text):
-    if not text:
-        return None
+    if not text: return None
     text = text.replace("\u202f", " ").replace("\xa0", " ")
-    pats = [r"([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)\s+(?:Views|views|перегляд|перегляди|переглядів)", r"(?:Views|views|перегляди|переглядів)\s*[:·]?\s*([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)"]
+    pats = [
+        r"([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)\s+(?:Views|views|перегляд|перегляди|переглядів)",
+        r"(?:Views|views|перегляди|переглядів)\s*[:·]?\s*([0-9]+(?:[.,][0-9]+)?\s*[KMBКМБ]?)",
+    ]
     for p in pats:
         m = re.search(p, text)
-        if m:
-            return normalize_number(m.group(1))
+        if m: return normalize_number(m.group(1))
     return None
 
 
 def prop_payload(props, name, value):
-    if name not in props or value is None:
-        return None
+    if name not in props or value is None: return None
     typ = props[name]["type"]
     if typ == "title": return {"title": [{"text": {"content": str(value)[:2000]}}]}
     if typ == "rich_text": return {"rich_text": [{"text": {"content": str(value)[:2000]}}]}
@@ -90,16 +81,14 @@ def prop_payload(props, name, value):
 def load_database_props(db_id):
     r = requests.get(f"https://api.notion.com/v1/databases/{db_id}", headers=notion_headers(), timeout=30)
     if r.status_code != 200:
-        print(f"notion database load error {r.status_code}: {r.text}")
-        return {}
+        print(f"notion database load error {r.status_code}: {r.text}"); return {}
     props = r.json().get("properties", {})
     print("loaded database properties:", ", ".join(props.keys()))
     return props
 
 
 def rich_text_to_plain(prop):
-    if not prop: return ""
-    typ = prop.get("type")
+    typ = prop.get("type") if prop else None
     if typ == "title": return "".join(x.get("plain_text", "") for x in prop.get("title", []))
     if typ == "rich_text": return "".join(x.get("plain_text", "") for x in prop.get("rich_text", []))
     return ""
@@ -107,23 +96,15 @@ def rich_text_to_plain(prop):
 
 def load_content_pulse_items():
     if not CONTENT_PULSE_DATABASE_ID:
-        print("no CONTENT_PULSE_DATABASE_ID, skip matching")
-        return []
-    body = {"page_size": 100}
-    r = requests.post(f"https://api.notion.com/v1/databases/{CONTENT_PULSE_DATABASE_ID}/query", headers=notion_headers(), json=body, timeout=30)
+        print("no CONTENT_PULSE_DATABASE_ID, skip matching"); return []
+    r = requests.post(f"https://api.notion.com/v1/databases/{CONTENT_PULSE_DATABASE_ID}/query", headers=notion_headers(), json={"page_size": 100}, timeout=30)
     if r.status_code != 200:
-        print(f"content pulse query error {r.status_code}: {r.text}")
-        return []
+        print(f"content pulse query error {r.status_code}: {r.text}"); return []
     items = []
     for page in r.json().get("results", []):
-        props = page.get("properties", {})
-        chunks = []
-        for name, prop in props.items():
-            if prop.get("type") in ["title", "rich_text"]:
-                chunks.append(rich_text_to_plain(prop))
+        chunks = [rich_text_to_plain(p) for p in page.get("properties", {}).values() if p.get("type") in ["title", "rich_text"]]
         text = "\n".join(chunks)
-        if text.strip():
-            items.append({"id": page["id"], "text": text})
+        if text.strip(): items.append({"id": page["id"], "text": text})
     print(f"loaded content pulse candidates: {len(items)}")
     return items
 
@@ -132,13 +113,10 @@ def find_content_match(post_text, candidates):
     best = (0, None)
     for c in candidates:
         score = similarity(post_text, c["text"])
-        if score > best[0]:
-            best = (score, c)
+        if score > best[0]: best = (score, c)
     if best[0] >= 0.55:
-        print(f"content pulse match score={best[0]:.2f}")
-        return best[1]["id"]
-    print(f"no content pulse match, best_score={best[0]:.2f}")
-    return None
+        print(f"content pulse match score={best[0]:.2f}"); return best[1]["id"]
+    print(f"no content pulse match, best_score={best[0]:.2f}"); return None
 
 
 def save_to_notion(item, props, candidates):
@@ -148,15 +126,12 @@ def save_to_notion(item, props, candidates):
         payload = prop_payload(props, k, v)
         if payload: properties[k] = payload
     match_id = find_content_match(item.get("text", ""), candidates)
-    if match_id and "Content Pulse Item" in props and props["Content Pulse Item"]["type"] == "relation":
+    if match_id and props.get("Content Pulse Item", {}).get("type") == "relation":
         properties["Content Pulse Item"] = {"relation": [{"id": match_id}]}
-    body = {"parent": {"database_id": DATABASE_ID}, "properties": properties}
-    r = requests.post("https://api.notion.com/v1/pages", headers=notion_headers(), json=body, timeout=30)
+    r = requests.post("https://api.notion.com/v1/pages", headers=notion_headers(), json={"parent": {"database_id": DATABASE_ID}, "properties": properties}, timeout=30)
     if r.status_code not in (200, 201):
-        print(f"notion error {r.status_code}: {r.text}")
-        return False
-    print(f"saved to Notion: {item['id']} views={item['views']}")
-    return True
+        print(f"notion error {r.status_code}: {r.text}"); return False
+    print(f"saved to Notion: {item['id']} {item['published_at']} views={item['views']}"); return True
 
 
 def add_cookies(context):
@@ -171,22 +146,42 @@ def add_cookies(context):
     print(f"loaded cookies: {len(cookies)}")
 
 
+def is_reply_or_thread_child(article, text):
+    low = text.lower()
+    markers = ["replying to", "у відповідь", "в ответ", "show this thread", "показати цю гілку", "показать эту ветку"]
+    if any(m in low for m in markers): return True
+    try:
+        # Replies/thread children usually have socialContext/user-name text above the tweet body.
+        social = article.locator("[data-testid='socialContext']").count()
+        if social > 0: return True
+    except Exception:
+        pass
+    return False
+
+
 def extract_post(article):
     try:
         text = article.inner_text(timeout=3000)
-        if any(x in text for x in ["Replying to", "У відповідь", "В ответ"]):
-            return None
+        if is_reply_or_thread_child(article, text): return None
+
+        # Use links that are inside THIS article only. Pick the last status link, usually canonical tweet link.
         links = article.locator("a[href*='/status/']").evaluate_all("els => els.map(a => a.href)")
         ids = []
         for href in links:
             m = re.search(r"/status/(\d+)", href)
-            if m: ids.append(m.group(1))
+            if m and f"/{X_HANDLE}/status/" in href:
+                ids.append(m.group(1))
         if not ids: return None
-        post_id = ids[0]
+        post_id = ids[-1]
+
         times = article.locator("time").evaluate_all("els => els.map(t => t.getAttribute('datetime'))")
         if not times: return None
-        published_at = times[0]
+        published_at = times[-1]
         dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+
+        # Hard date gate inside extraction, so Aug 2 cannot pass.
+        if not (START_DT <= dt < END_DT): return None
+
         aria = article.evaluate("""el => Array.from(el.querySelectorAll('[aria-label]')).map(x => x.getAttribute('aria-label')).filter(Boolean).join(' | ')""")
         views = parse_views(text) or parse_views(aria)
         if views is None or views > 20000000: return None
@@ -196,10 +191,10 @@ def extract_post(article):
 
 
 def main():
-    if not re.fullmatch(r"[0-9a-fA-F]{32}", DATABASE_ID):
-        raise RuntimeError(f"Bad DATABASE_ID: {DATABASE_ID!r}")
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", DATABASE_ID): raise RuntimeError(f"Bad DATABASE_ID: {DATABASE_ID!r}")
+    print("CODE_VERSION: strict_dates_no_replies_v3")
     print(f"opening https://x.com/{X_HANDLE}")
-    print(f"exact date range: {START_DATE} through {END_DATE}")
+    print(f"STRICT_DATE_RANGE: {START_DATE} 00:00 UTC through {END_DATE} 23:59 UTC")
     print(f"save limit: {SAVE_LIMIT}")
     seen = {}
     with sync_playwright() as p:
@@ -218,17 +213,16 @@ def main():
                 item = extract_post(articles.nth(i))
                 if item and item["id"] not in seen:
                     seen[item["id"]] = item; new_this += 1
-                    print(f"found post: {item['id']} published_at={item['published_at']} views={item['views']}")
-            print(f"scroll {scroll}: article nodes={count}, raw={len(seen)}, new_this_scroll={new_this}")
+                    print(f"qualified found: {item['id']} {item['published_at']} views={item['views']}")
+            print(f"scroll {scroll}: article nodes={count}, qualified_raw={len(seen)}, new_this_scroll={new_this}")
             no_new = no_new + 1 if new_this == 0 else 0
-            if no_new >= 10: break
+            if no_new >= 25: break
             page.mouse.wheel(0, 3500); time.sleep(2)
         page.screenshot(path="x_debug_after_scroll.png", full_page=True)
         browser.close()
-    qualified = [x for x in seen.values() if START_DT <= x["dt"] < END_DT]
-    qualified.sort(key=lambda x: x["dt"], reverse=True)
-    print(f"raw posts: {len(seen)}")
-    print(f"posts in exact date range ({START_DATE}..{END_DATE}): {len(qualified)}")
+    qualified = sorted(seen.values(), key=lambda x: x["dt"], reverse=True)
+    print(f"FINAL qualified posts in strict date range ({START_DATE}..{END_DATE}): {len(qualified)}")
+    for q in qualified[:30]: print(f"QUALIFIED_CHECK: {q['id']} {q['published_at']} views={q['views']}")
     if SAVE_LIMIT > 0:
         qualified = qualified[:SAVE_LIMIT]
         print(f"limited qualified for test: {len(qualified)}")
@@ -238,5 +232,4 @@ def main():
     print(f"saved={saved}, attempted={len(qualified)}")
     print("verdict: saved to Notion" if saved else "verdict: posts found, but none saved to Notion")
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
