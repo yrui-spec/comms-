@@ -27,6 +27,7 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
           X_HANDLE: Mylovanov
+          X_COOKIES_JSON: ${{ secrets.X_COOKIES_JSON }}
         run: python x_pilot.py
 
       - name: Upload debug screenshots
