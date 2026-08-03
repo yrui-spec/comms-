@@ -27,8 +27,11 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
+          CONTENT_PULSE_DATABASE_ID: ${{ secrets.CONTENT_PULSE_DATABASE_ID }}
           X_COOKIES_JSON: ${{ secrets.X_COOKIES_JSON }}
           X_HANDLE: Mylovanov
+          START_DATE: "2026-07-27"
+          END_DATE: "2026-08-01"
           SAVE_LIMIT: "10"
           MAX_SCROLLS: "220"
         run: python x_pilot.py
