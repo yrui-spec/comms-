@@ -3,20 +3,14 @@ name: Collect X metrics
 on:
   workflow_dispatch:
     inputs:
-      start_date:
-        description: "Start date YYYY-MM-DD"
+      target_date:
+        description: "Exact date YYYY-MM-DD"
         required: true
-        default: "2026-07-27"
-      end_date:
-        description: "End date YYYY-MM-DD"
-        required: true
-        default: "2026-08-01"
+        default: "2026-07-28"
       save_limit:
         description: "How many rows to save; 0 = all"
         required: true
         default: "10"
-  schedule:
-    - cron: "0 8 * * *"
 
 jobs:
   collect:
@@ -43,10 +37,9 @@ jobs:
           CONTENT_PULSE_DATABASE_ID: ${{ secrets.CONTENT_PULSE_DATABASE_ID }}
           X_COOKIES_JSON: ${{ secrets.X_COOKIES_JSON }}
           X_HANDLE: Mylovanov
-          START_DATE: ${{ github.event.inputs.start_date || '2026-07-27' }}
-          END_DATE: ${{ github.event.inputs.end_date || '2026-08-01' }}
+          TARGET_DATE: ${{ github.event.inputs.target_date || '2026-07-28' }}
           SAVE_LIMIT: ${{ github.event.inputs.save_limit || '10' }}
-          MAX_SCROLLS: "260"
+          MAX_SCROLLS: "500"
         run: python x_pilot.py
 
       - name: Upload debug screenshots
